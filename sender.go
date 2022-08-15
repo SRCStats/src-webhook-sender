@@ -9,19 +9,34 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/time/rate"
 )
 
 var (
 	database   string
 	collection string
 	wg         sync.WaitGroup
+	cS         SpeedrunClient
+	cD         DiscordClient
 )
+
+type DiscordClient struct {
+	client  *http.Client
+	limiter *rate.Limiter
+}
+
+type SpeedrunClient struct {
+	client  *http.Client
+	limiter *rate.Limiter
+}
 
 const (
 	connectionStringEnv = "SRC_WEBHOOK_MONGODB_CONNECTION_STRING"
@@ -165,6 +180,17 @@ type Data struct {
 	} `json:"platform,omitempty"`
 }
 
+type Leaderboard struct {
+	Data struct {
+		Runs []struct {
+			Place int `json:"place,omitempty"`
+			Run   struct {
+				ID string `json:"id,omitempty"`
+			} `json:"run,omitempty"`
+		} `json:"runs,omitempty"`
+	} `json:"data,omitempty"`
+}
+
 type Response struct {
 	Data       []Data `json:"data,omitempty"`
 	Pagination struct {
@@ -175,17 +201,69 @@ type Response struct {
 	Scope string `json:"scope,omitempty"`
 }
 
+func (c *SpeedrunClient) Do(req *http.Request) (*http.Response, error) {
+	ctx := context.Background()
+	err := c.limiter.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *DiscordClient) Do(webhookUrl string, body []byte) (*http.Response, error) {
+	ctx := context.Background()
+	err := c.limiter.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := http.Post(webhookUrl, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func NewSClient(r *rate.Limiter) *SpeedrunClient {
+	cl := http.Client{
+		Timeout: time.Second * 10,
+	}
+	c := &SpeedrunClient{
+		client:  &cl,
+		limiter: r,
+	}
+	return c
+}
+
+func NewDClient(r *rate.Limiter) *DiscordClient {
+	cl := http.Client{
+		Timeout: time.Second * 10,
+	}
+	c := &DiscordClient{
+		client:  &cl,
+		limiter: r,
+	}
+	return c
+}
+
 func main() {
 	listenAddr := ":8080"
 	if val, ok := os.LookupEnv("FUNCTIONS_CUSTOMHANDLER_PORT"); ok {
 		listenAddr = ":" + val
 	}
+	rS, rD := rate.NewLimiter(rate.Every(1*time.Minute), 33), rate.NewLimiter(rate.Every(3*time.Second), 5)
+	cS, cD = *NewSClient(rS), *NewDClient(rD)
 	http.HandleFunc("/api/SendWebhook", runsHandler)
+	log.Printf("About to listen on %s. Go to https://127.0.0.1%s/", listenAddr, listenAddr)
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
 
 func runsHandler(w http.ResponseWriter, r *http.Request) {
 	// todo: handle invalid bodies
+
 	body := r.Body
 	defer body.Close()
 	b, err := io.ReadAll(body)
@@ -201,7 +279,6 @@ func runsHandler(w http.ResponseWriter, r *http.Request) {
 	switch data[0].Status.Status {
 	case "verified":
 		HandleVerified(&data, &webhooks)
-		break
 	case "new":
 		break
 	case "rejected":
@@ -217,18 +294,17 @@ func HandleVerified(data *[]Data, webhooks *[]Webhook) {
 		for _, webhook := range *webhooks {
 			for _, category := range webhook.Records.Categories {
 				if category == run.Category.Data.ID {
-					fmt.Print(category)
 					if run.Players.Data[0].Names.International == "" {
 						continue nextWebhook
 					}
-					SendWebhook(&webhook, &run, "verified", 0)
+					go SendWebhook(&webhook, run, "verified", 0)
 					continue nextWebhook
 				}
 			}
 			for i, player := range run.Players.Data {
 				for _, wPlayer := range webhook.Records.Users {
 					if wPlayer == player.ID {
-						SendWebhook(&webhook, &run, "verified", i)
+						go SendWebhook(&webhook, run, "verified", i)
 						continue nextWebhook
 					}
 				}
@@ -238,7 +314,8 @@ func HandleVerified(data *[]Data, webhooks *[]Webhook) {
 	wg.Done()
 }
 
-func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
+func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
+	// todo: add handling for multiple webhooks wanting the same run
 	wg.Add(1)
 	time.Sleep(1 * time.Second)
 	switch scope {
@@ -251,7 +328,7 @@ func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
 		} else {
 			author = run.Players.Data[playerIndex].Names.International
 		}
-		var category, variables, players, iconUrl, runTime string
+		var category, variables, players, iconUrl, runTime, place string
 		for key, value := range run.Values {
 			for _, variable := range run.Category.Data.Variables.Data {
 				if variable.ID == key {
@@ -273,6 +350,13 @@ func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
 						}
 					}
 				}
+			}
+		}
+		lb := GetLeaderboard(run)
+		for _, lbRun := range lb.Data.Runs {
+			if lbRun.Run.ID == run.ID {
+				place = humanize.Ordinal(lbRun.Place)
+				break
 			}
 		}
 		if len(run.Players.Data) > 1 {
@@ -302,11 +386,30 @@ func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
 		if variables != "" {
 			variables += ")"
 		}
-		if iconUrl == "" {
-			iconUrl = "" //run.Game.Data.Assets.Trophy1st.URI
-		}
 		if runTime == "" {
 			runTime = "0s"
+		}
+		switch place {
+		case "1st":
+			if run.Game.Data.Assets.Trophy1st.URI != "" {
+				iconUrl = run.Game.Data.Assets.Trophy1st.URI
+			} else {
+				iconUrl = "https://www.speedrun.com/images/1st.png"
+			}
+		case "2nd":
+			if run.Game.Data.Assets.Trophy2nd.URI != "" {
+				iconUrl = run.Game.Data.Assets.Trophy2nd.URI
+			} else {
+				iconUrl = "https://www.speedrun.com/images/2nd.png"
+			}
+		case "3rd":
+			if run.Game.Data.Assets.Trophy3rd.URI != "" {
+				iconUrl = run.Game.Data.Assets.Trophy3rd.URI
+			} else {
+				iconUrl = "https://www.speedrun.com/images/3rd.png"
+			}
+		default:
+			iconUrl = ""
 		}
 		fields := []map[string]interface{}{
 			{
@@ -345,33 +448,37 @@ func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
 				},
 			}, fields...)
 		}
-		jsonBody := map[string]interface{}{
-			"content": nil,
-			"embeds": []map[string]interface{}{
-				{
-					"author": map[string]interface{}{
-						"name":     run.Players.Data[playerIndex].Names.International,
-						"url":      run.Players.Data[playerIndex].Weblink,
-						"icon_url": run.Players.Data[playerIndex].Assets.Image.URI,
-					},
-					"color":       "15899392",
-					"title":       fmt.Sprintf("New personal best by %v!", author),
-					"description": fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International),
-					"fields":      fields,
-					"url":         run.Weblink,
-					"footer": map[string]interface{}{
-						"text":     fmt.Sprintf("They're now %v place!", "(run place)"),
-						"icon_url": iconUrl,
-					},
+		embeds := []map[string]interface{}{
+			{
+				"author": map[string]interface{}{
+					"name":     run.Players.Data[playerIndex].Names.International,
+					"url":      run.Players.Data[playerIndex].Weblink,
+					"icon_url": run.Players.Data[playerIndex].Assets.Image.URI,
 				},
+				"color":       "15899392",
+				"title":       fmt.Sprintf("New personal best by %v!", author),
+				"description": fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International),
+				"fields":      fields,
+				"url":         run.Weblink,
 			},
+		}
+		if place != "" {
+			embeds[0]["footer"] = map[string]interface{}{
+				"text":     fmt.Sprintf("They're now %v place!", place),
+				"icon_url": iconUrl,
+			}
+		}
+		jsonBody := map[string]interface{}{
+			"content":     nil,
+			"embeds":      embeds,
 			"attachments": nil,
 		}
 		body, err := json.Marshal(jsonBody)
 		if err != nil {
 			log.Printf("Error while marshalling webhook body!\n%v", err)
 		}
-		res, err := http.Post(webhook.WebhookUrl, "application/json", bytes.NewBuffer(body))
+		time.Sleep(500 * time.Millisecond)
+		res, err := cD.Do(webhook.WebhookUrl, body)
 		if err != nil {
 			log.Printf("Error while sending webhook!\n%v", err)
 		} else {
@@ -384,7 +491,6 @@ func SendWebhook(webhook *Webhook, run *Data, scope string, playerIndex int) {
 		if res.StatusCode == 429 {
 			log.Printf("Webhook %v is over rate limit!", webhook.WebhookUrl)
 		}
-		break
 	case "new":
 		break
 	case "rejected":
@@ -461,4 +567,46 @@ func DeleteWebhook(webhook Webhook) {
 		log.Printf("Error while deleting webhook!\n%v", err)
 	}
 	log.Printf("Deleted %v webhook with url %v", result.DeletedCount, webhook.WebhookUrl)
+}
+
+func GetLeaderboard(run Data) Leaderboard {
+	if run.Level.Data.Name == "" {
+		r, err := cS.Do(createReq("/" + run.Game.Data.ID + "/category/" + run.Category.Data.ID))
+		if err != nil {
+			log.Printf("Error while getting leaderboard!\n%v", err)
+		}
+		return parseRes(r)
+	} else {
+		r, err := cS.Do(createReq("/" + run.Game.Data.ID + "/level/" + run.Level.Data.ID + "/" + run.Category.Data.ID))
+		if err != nil {
+			log.Printf("Error while getting leaderboard!\n%v", err)
+		}
+		return parseRes(r)
+	}
+}
+
+func createReq(queries string) *http.Request {
+	url := "https://speedrun.com/api/v1/leaderboards"
+	req, err := http.NewRequest("GET", url+queries+"?vary="+strconv.FormatInt(int64(time.Now().Nanosecond()), 10), nil)
+	if err != nil {
+		log.Panic(err)
+	}
+	req.Header.Add("User-Agent", "SRCStats Webhook")
+	fmt.Println(req)
+	return req
+}
+
+func parseRes(r *http.Response) Leaderboard {
+	fmt.Println(r)
+	if r == nil || r.StatusCode == 400 || r.StatusCode == 404 {
+		return *new(Leaderboard)
+	}
+	result, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Panic(err)
+	}
+	r.Body.Close()
+	var res Leaderboard
+	json.Unmarshal(result, &res)
+	return res
 }
