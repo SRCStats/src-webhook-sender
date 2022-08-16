@@ -321,6 +321,7 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 	switch scope {
 	case "verified":
 		var author string
+		subCats := make(map[string]string)
 		if len(run.Players.Data) > 2 {
 			author = fmt.Sprintf("%v and %v others", run.Players.Data[playerIndex].Names.International, len(run.Players.Data)-1)
 		} else if len(run.Players.Data) > 1 {
@@ -335,6 +336,7 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 					for varId, varVal := range variable.Values["choices"].(map[string]interface{}) {
 						if varId == value {
 							if variable.IsSubcategory {
+								subCats[key] = varId
 								if category != "" {
 									category += fmt.Sprintf(", %v", varVal)
 								} else {
@@ -352,12 +354,16 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 				}
 			}
 		}
-		lb := GetLeaderboard(run)
+		lb := GetLeaderboard(run, subCats)
 		for _, lbRun := range lb.Data.Runs {
 			if lbRun.Run.ID == run.ID {
 				place = humanize.Ordinal(lbRun.Place)
 				break
 			}
+		}
+		// this check could be optimized by just checking only the top 1 player if the event filter is "wr", instead of getting the whole leaderboard
+		if webhook.Records.Events == "wr" && place != "1st" {
+			return
 		}
 		if len(run.Players.Data) > 1 {
 			for _, player := range run.Players.Data {
@@ -467,6 +473,10 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 				"text":     fmt.Sprintf("They're now %v place!", place),
 				"icon_url": iconUrl,
 			}
+			if place == "1st" {
+				embeds[0]["title"] = fmt.Sprintf("New world record in %v in %v!", category, run.Game.Data.Names.International)
+				embeds[0]["description"] = fmt.Sprintf("**%v** got a new world record in **%v**!", author, run.Game.Data.Names.International)
+			}
 		}
 		jsonBody := map[string]interface{}{
 			"content":     nil,
@@ -481,8 +491,6 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 		res, err := cD.Do(webhook.WebhookUrl, body)
 		if err != nil {
 			log.Printf("Error while sending webhook!\n%v", err)
-		} else {
-			log.Printf("Webhook sent to %v!", webhook.WebhookUrl)
 		}
 		if res.StatusCode == 404 {
 			log.Printf("Webhook %v is not found!", webhook.WebhookUrl)
@@ -569,35 +577,50 @@ func DeleteWebhook(webhook Webhook) {
 	log.Printf("Deleted %v webhook with url %v", result.DeletedCount, webhook.WebhookUrl)
 }
 
-func GetLeaderboard(run Data) Leaderboard {
+func GetLeaderboard(run Data, subCats map[string]string) Leaderboard {
+	queryFrag := fmt.Sprintf("/%v", run.Game.Data.ID)
 	if run.Level.Data.Name == "" {
-		r, err := cS.Do(createReq("/" + run.Game.Data.ID + "/category/" + run.Category.Data.ID))
-		if err != nil {
-			log.Printf("Error while getting leaderboard!\n%v", err)
-		}
-		return parseRes(r)
+		queryFrag += fmt.Sprintf("/category/%v", run.Category.Data.ID)
 	} else {
-		r, err := cS.Do(createReq("/" + run.Game.Data.ID + "/level/" + run.Level.Data.ID + "/" + run.Category.Data.ID))
+		queryFrag += fmt.Sprintf("/level/%v/%v", run.Level.Data.ID, run.Category.Data.ID)
+	}
+	i := 0
+	for subCatId, subCatVal := range subCats {
+		if i == 0 {
+			queryFrag += fmt.Sprintf("?var-%v=%v", subCatId, subCatVal)
+		} else {
+			queryFrag += fmt.Sprintf("&var-%v=%v", subCatId, subCatVal)
+		}
+		i++
+	}
+	// these vary queries aren't as aggressive as the fetcher's, since we don't mind cached within the last few seconds leaderboards
+	if i == 0 {
+		queryFrag += "?vary=" + strconv.FormatInt(int64(time.Now().Unix()), 10)
+	} else {
+		queryFrag += "&vary=" + strconv.FormatInt(int64(time.Now().Unix()), 10)
+	}
+	r, err := cS.Do(createReq(queryFrag))
+	if err != nil {
+		log.Printf("Error while getting leaderboard!\n%v", err)
+		r, err = cS.Do(createReq(queryFrag + "&top=3"))
 		if err != nil {
 			log.Printf("Error while getting leaderboard!\n%v", err)
 		}
-		return parseRes(r)
 	}
+	return parseRes(r)
 }
 
 func createReq(queries string) *http.Request {
 	url := "https://speedrun.com/api/v1/leaderboards"
-	req, err := http.NewRequest("GET", url+queries+"?vary="+strconv.FormatInt(int64(time.Now().Nanosecond()), 10), nil)
+	req, err := http.NewRequest("GET", url+queries, nil)
 	if err != nil {
 		log.Panic(err)
 	}
 	req.Header.Add("User-Agent", "SRCStats Webhook")
-	fmt.Println(req)
 	return req
 }
 
 func parseRes(r *http.Response) Leaderboard {
-	fmt.Println(r)
 	if r == nil || r.StatusCode == 400 || r.StatusCode == 404 {
 		return *new(Leaderboard)
 	}
