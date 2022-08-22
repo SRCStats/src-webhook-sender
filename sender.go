@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -180,14 +181,12 @@ type Data struct {
 	} `json:"platform,omitempty"`
 }
 
-type Leaderboard struct {
-	Data struct {
-		Runs []struct {
-			Place int `json:"place,omitempty"`
-			Run   struct {
-				ID string `json:"id,omitempty"`
-			} `json:"run,omitempty"`
-		} `json:"runs,omitempty"`
+type PBs struct {
+	Data []struct {
+		Place int `json:"place,omitempty"`
+		Run   struct {
+			ID string `json:"id,omitempty"`
+		} `json:"run,omitempty"`
 	} `json:"data,omitempty"`
 }
 
@@ -354,15 +353,21 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 				}
 			}
 		}
-		lb := GetLeaderboard(run, subCats)
-		for _, lbRun := range lb.Data.Runs {
-			if lbRun.Run.ID == run.ID {
-				place = humanize.Ordinal(lbRun.Place)
+		// this check could be optimized by just checking only the top 1 player if the event filter is "wr", instead of getting the whole leaderboard
+		if webhook.Records.Events == "wr" && place != "1st" {
+			return
+		}
+		// this check only checks for the player of playerIndex having it be a pb
+		isPb := false
+		pbs := GetPersonalBests(run.Players.Data[playerIndex].ID, run.Game.Data.ID)
+		for _, pb := range pbs.Data {
+			if pb.Run.ID == run.ID {
+				place = humanize.Ordinal(pb.Place)
+				isPb = true
 				break
 			}
 		}
-		// this check could be optimized by just checking only the top 1 player if the event filter is "wr", instead of getting the whole leaderboard
-		if webhook.Records.Events == "wr" && place != "1st" {
+		if webhook.Records.Events == "pb" && !isPb {
 			return
 		}
 		if len(run.Players.Data) > 1 {
@@ -382,8 +387,16 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 				}
 			}
 		}
-		dur := time.Duration(run.Times.Primary) * time.Second
+		s, ms := math.Modf(run.Times.Primary)
+		msString := fmt.Sprintf("%.3f", ms)
+		dur := time.Duration(s) * time.Second
 		runTime = dur.String()
+		runTime = strings.Replace(runTime, "h", "h ", 1)
+		runTime = strings.Replace(runTime, "m", "m ", 1)
+		runTime = strings.Replace(runTime, "s", "s ", 1)
+		if msString != "0.000" {
+			runTime += msString[2:] + "ms"
+		}
 		if category != "" {
 			category += ")"
 		} else {
@@ -461,22 +474,26 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 					"url":      run.Players.Data[playerIndex].Weblink,
 					"icon_url": run.Players.Data[playerIndex].Assets.Image.URI,
 				},
-				"color":       "15899392",
-				"title":       fmt.Sprintf("New personal best by %v!", author),
-				"description": fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International),
-				"fields":      fields,
-				"url":         run.Weblink,
+				"color":  "15899392",
+				"fields": fields,
+				"url":    run.Weblink,
 			},
 		}
-		if place != "" {
+		if place != "" && isPb {
 			embeds[0]["footer"] = map[string]interface{}{
 				"text":     fmt.Sprintf("They're now %v place!", place),
 				"icon_url": iconUrl,
 			}
-			if place == "1st" {
-				embeds[0]["title"] = fmt.Sprintf("New world record in %v in %v!", category, run.Game.Data.Names.International)
-				embeds[0]["description"] = fmt.Sprintf("**%v** got a new world record in **%v**!", author, run.Game.Data.Names.International)
-			}
+		}
+		if place == "1st" {
+			embeds[0]["title"] = fmt.Sprintf("New world record in %v in %v!", category, run.Game.Data.Names.International)
+			embeds[0]["description"] = fmt.Sprintf("**%v** got a new world record in **%v**!", author, run.Game.Data.Names.International)
+		} else if isPb {
+			embeds[0]["title"] = fmt.Sprintf("New personal best by %v!", author)
+			embeds[0]["description"] = fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International)
+		} else {
+			embeds[0]["title"] = fmt.Sprintf("New run by %v!", author)
+			embeds[0]["description"] = fmt.Sprintf("**%v** submitted a new run in **%v**!", author, run.Game.Data.Names.International)
 		}
 		jsonBody := map[string]interface{}{
 			"content":     nil,
@@ -577,41 +594,17 @@ func DeleteWebhook(webhook Webhook) {
 	log.Printf("Deleted %v webhook with url %v", result.DeletedCount, webhook.WebhookUrl)
 }
 
-func GetLeaderboard(run Data, subCats map[string]string) Leaderboard {
-	queryFrag := fmt.Sprintf("/%v", run.Game.Data.ID)
-	if run.Level.Data.Name == "" {
-		queryFrag += fmt.Sprintf("/category/%v", run.Category.Data.ID)
-	} else {
-		queryFrag += fmt.Sprintf("/level/%v/%v", run.Level.Data.ID, run.Category.Data.ID)
-	}
-	i := 0
-	for subCatId, subCatVal := range subCats {
-		if i == 0 {
-			queryFrag += fmt.Sprintf("?var-%v=%v", subCatId, subCatVal)
-		} else {
-			queryFrag += fmt.Sprintf("&var-%v=%v", subCatId, subCatVal)
-		}
-		i++
-	}
-	// these vary queries aren't as aggressive as the fetcher's, since we don't mind cached within the last few seconds leaderboards
-	if i == 0 {
-		queryFrag += "?vary=" + strconv.FormatInt(int64(time.Now().Unix()), 10)
-	} else {
-		queryFrag += "&vary=" + strconv.FormatInt(int64(time.Now().Unix()), 10)
-	}
+func GetPersonalBests(user string, game string) PBs {
+	queryFrag := fmt.Sprintf("/users/%v/personal-bests?game=%v", user, game)
 	r, err := cS.Do(createReq(queryFrag))
 	if err != nil {
 		log.Printf("Error while getting leaderboard!\n%v", err)
-		r, err = cS.Do(createReq(queryFrag + "&top=3"))
-		if err != nil {
-			log.Printf("Error while getting leaderboard!\n%v", err)
-		}
 	}
-	return parseRes(r)
+	return parseResPBs(r)
 }
 
 func createReq(queries string) *http.Request {
-	url := "https://speedrun.com/api/v1/leaderboards"
+	url := "https://speedrun.com/api/v1"
 	req, err := http.NewRequest("GET", url+queries, nil)
 	if err != nil {
 		log.Panic(err)
@@ -620,16 +613,16 @@ func createReq(queries string) *http.Request {
 	return req
 }
 
-func parseRes(r *http.Response) Leaderboard {
+func parseResPBs(r *http.Response) PBs {
 	if r == nil || r.StatusCode == 400 || r.StatusCode == 404 {
-		return *new(Leaderboard)
+		return *new(PBs)
 	}
 	result, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Panic(err)
 	}
 	r.Body.Close()
-	var res Leaderboard
+	var res PBs
 	json.Unmarshal(result, &res)
 	return res
 }
