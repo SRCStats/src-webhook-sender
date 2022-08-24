@@ -57,6 +57,7 @@ type Webhook struct {
 		IDs     []string `json:"IDs,omitempty"`
 		Events  []string `json:"Events,omitempty"`
 	}
+	PlayerIndex int `json:"PlayerIndex,omitempty"`
 }
 
 type Data struct {
@@ -283,52 +284,49 @@ func runsHandler(w http.ResponseWriter, r *http.Request) {
 	case "rejected":
 		break
 	}
+	w.WriteHeader(200)
 }
 
 func HandleVerified(data *[]Data, webhooks *[]Webhook) {
 	wg.Add(1)
 	for _, run := range *data {
+		webhooksToSend := make(map[string]Webhook)
 	nextWebhook:
-		// todo: add handling for listings of categories and users on same webhook
 		for _, webhook := range *webhooks {
 			for _, category := range webhook.Records.Categories {
 				if category == run.Category.Data.ID {
-					if run.Players.Data[0].Names.International == "" {
+					// this is handling for a guest player as the first player, we don't want to send a webhook for that
+					if run.Players.Data[0].Names.International != "" {
+						webhook.PlayerIndex = 0
+						webhooksToSend[webhook.WebhookUrl] = webhook
 						continue nextWebhook
 					}
-					go SendWebhook(&webhook, run, "verified", 0)
-					continue nextWebhook
 				}
 			}
 			for i, player := range run.Players.Data {
 				for _, wPlayer := range webhook.Records.Users {
 					if wPlayer == player.ID {
-						go SendWebhook(&webhook, run, "verified", i)
+						webhook.PlayerIndex = i
+						webhooksToSend[webhook.WebhookUrl] = webhook
 						continue nextWebhook
 					}
 				}
 			}
 		}
+		if len(webhooksToSend) > 0 {
+			wg.Add(1)
+			go SendWebhook(&webhooksToSend, run, "verified")
+		}
 	}
 	wg.Done()
 }
 
-func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
+func SendWebhook(webhooks *map[string]Webhook, run Data, scope string) {
 	// todo: add handling for multiple webhooks wanting the same run
-	wg.Add(1)
-	time.Sleep(1 * time.Second)
 	switch scope {
 	case "verified":
-		var author string
+		var category, variables, players, iconUrl, runTime, place, author string
 		subCats := make(map[string]string)
-		if len(run.Players.Data) > 2 {
-			author = fmt.Sprintf("%v and %v others", run.Players.Data[playerIndex].Names.International, len(run.Players.Data)-1)
-		} else if len(run.Players.Data) > 1 {
-			author = fmt.Sprintf("%v and %v other", run.Players.Data[playerIndex].Names.International, len(run.Players.Data)-1)
-		} else {
-			author = run.Players.Data[playerIndex].Names.International
-		}
-		var category, variables, players, iconUrl, runTime, place string
 		for key, value := range run.Values {
 			for _, variable := range run.Category.Data.Variables.Data {
 				if variable.ID == key {
@@ -352,23 +350,6 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 					}
 				}
 			}
-		}
-		// this check could be optimized by just checking only the top 1 player if the event filter is "wr", instead of getting the whole leaderboard
-		if webhook.Records.Events == "wr" && place != "1st" {
-			return
-		}
-		// this check only checks for the player of playerIndex having it be a pb
-		isPb := false
-		pbs := GetPersonalBests(run.Players.Data[playerIndex].ID, run.Game.Data.ID)
-		for _, pb := range pbs.Data {
-			if pb.Run.ID == run.ID {
-				place = humanize.Ordinal(pb.Place)
-				isPb = true
-				break
-			}
-		}
-		if webhook.Records.Events == "pb" && !isPb {
-			return
 		}
 		if len(run.Players.Data) > 1 {
 			for _, player := range run.Players.Data {
@@ -408,28 +389,6 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 		if runTime == "" {
 			runTime = "0s"
 		}
-		switch place {
-		case "1st":
-			if run.Game.Data.Assets.Trophy1st.URI != "" {
-				iconUrl = run.Game.Data.Assets.Trophy1st.URI
-			} else {
-				iconUrl = "https://www.speedrun.com/images/1st.png"
-			}
-		case "2nd":
-			if run.Game.Data.Assets.Trophy2nd.URI != "" {
-				iconUrl = run.Game.Data.Assets.Trophy2nd.URI
-			} else {
-				iconUrl = "https://www.speedrun.com/images/2nd.png"
-			}
-		case "3rd":
-			if run.Game.Data.Assets.Trophy3rd.URI != "" {
-				iconUrl = run.Game.Data.Assets.Trophy3rd.URI
-			} else {
-				iconUrl = "https://www.speedrun.com/images/3rd.png"
-			}
-		default:
-			iconUrl = ""
-		}
 		fields := []map[string]interface{}{
 			{
 				"name":   "Category",
@@ -467,54 +426,104 @@ func SendWebhook(webhook *Webhook, run Data, scope string, playerIndex int) {
 				},
 			}, fields...)
 		}
-		embeds := []map[string]interface{}{
-			{
-				"author": map[string]interface{}{
-					"name":     run.Players.Data[playerIndex].Names.International,
-					"url":      run.Players.Data[playerIndex].Weblink,
-					"icon_url": run.Players.Data[playerIndex].Assets.Image.URI,
-				},
-				"color":  "15899392",
-				"fields": fields,
-				"url":    run.Weblink,
-			},
-		}
-		if place != "" && isPb {
-			embeds[0]["footer"] = map[string]interface{}{
-				"text":     fmt.Sprintf("They're now %v place!", place),
-				"icon_url": iconUrl,
+		userPBs := make(map[int]PBs)
+		for _, webhook := range *webhooks {
+			wg.Add(1)
+			if _, ok := userPBs[webhook.PlayerIndex]; !ok {
+				userPBs[webhook.PlayerIndex] = GetPersonalBests(run.Players.Data[webhook.PlayerIndex].ID, run.Game.Data.ID)
 			}
-		}
-		if place == "1st" {
-			embeds[0]["title"] = fmt.Sprintf("New world record in %v in %v!", category, run.Game.Data.Names.International)
-			embeds[0]["description"] = fmt.Sprintf("**%v** got a new world record in **%v**!", author, run.Game.Data.Names.International)
-		} else if isPb {
-			embeds[0]["title"] = fmt.Sprintf("New personal best by %v!", author)
-			embeds[0]["description"] = fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International)
-		} else {
-			embeds[0]["title"] = fmt.Sprintf("New run by %v!", author)
-			embeds[0]["description"] = fmt.Sprintf("**%v** submitted a new run in **%v**!", author, run.Game.Data.Names.International)
-		}
-		jsonBody := map[string]interface{}{
-			"content":     nil,
-			"embeds":      embeds,
-			"attachments": nil,
-		}
-		body, err := json.Marshal(jsonBody)
-		if err != nil {
-			log.Printf("Error while marshalling webhook body!\n%v", err)
-		}
-		time.Sleep(500 * time.Millisecond)
-		res, err := cD.Do(webhook.WebhookUrl, body)
-		if err != nil {
-			log.Printf("Error while sending webhook!\n%v", err)
-		}
-		if res.StatusCode == 404 {
-			log.Printf("Webhook %v is not found!", webhook.WebhookUrl)
-			DeleteWebhook(*webhook)
-		}
-		if res.StatusCode == 429 {
-			log.Printf("Webhook %v is over rate limit!", webhook.WebhookUrl)
+			go func(webhook Webhook, playerIndex int) {
+				// This is for making sure the proper user is being checked for sending the webhook
+				isPb := false
+				for _, pb := range userPBs[playerIndex].Data {
+					if pb.Run.ID == run.ID {
+						place = humanize.Ordinal(pb.Place)
+						isPb = true
+						break
+					}
+				}
+				switch place {
+				case "1st":
+					if run.Game.Data.Assets.Trophy1st.URI != "" {
+						iconUrl = run.Game.Data.Assets.Trophy1st.URI
+					} else {
+						iconUrl = "https://www.speedrun.com/images/1st.png"
+					}
+				case "2nd":
+					if run.Game.Data.Assets.Trophy2nd.URI != "" {
+						iconUrl = run.Game.Data.Assets.Trophy2nd.URI
+					} else {
+						iconUrl = "https://www.speedrun.com/images/2nd.png"
+					}
+				case "3rd":
+					if run.Game.Data.Assets.Trophy3rd.URI != "" {
+						iconUrl = run.Game.Data.Assets.Trophy3rd.URI
+					} else {
+						iconUrl = "https://www.speedrun.com/images/3rd.png"
+					}
+				default:
+					iconUrl = ""
+				}
+				if webhook.Records.Events == "pb" && !isPb {
+					return
+				}
+				if len(run.Players.Data) > 2 {
+					author = fmt.Sprintf("%v and %v others", run.Players.Data[playerIndex].Names.International, len(run.Players.Data)-1)
+				} else if len(run.Players.Data) > 1 {
+					author = fmt.Sprintf("%v and %v other", run.Players.Data[playerIndex].Names.International, len(run.Players.Data)-1)
+				} else {
+					author = run.Players.Data[playerIndex].Names.International
+				}
+				embeds := []map[string]interface{}{
+					{
+						"author": map[string]interface{}{
+							"name":     run.Players.Data[playerIndex].Names.International,
+							"url":      run.Players.Data[playerIndex].Weblink,
+							"icon_url": run.Players.Data[playerIndex].Assets.Image.URI,
+						},
+						"color":  "15899392",
+						"fields": fields,
+						"url":    run.Weblink,
+					},
+				}
+				if place != "" && isPb {
+					embeds[0]["footer"] = map[string]interface{}{
+						"text":     fmt.Sprintf("They're now %v place!", place),
+						"icon_url": iconUrl,
+					}
+				}
+				if place == "1st" {
+					embeds[0]["title"] = fmt.Sprintf("New world record in %v in %v!", category, run.Game.Data.Names.International)
+					embeds[0]["description"] = fmt.Sprintf("**%v** got a new world record in **%v**!", author, run.Game.Data.Names.International)
+				} else if isPb {
+					embeds[0]["title"] = fmt.Sprintf("New personal best by %v!", author)
+					embeds[0]["description"] = fmt.Sprintf("**%v** got a new personal best in **%v**!", author, run.Game.Data.Names.International)
+				} else {
+					embeds[0]["title"] = fmt.Sprintf("New run by %v!", author)
+					embeds[0]["description"] = fmt.Sprintf("**%v** submitted a new run in **%v**!", author, run.Game.Data.Names.International)
+				}
+				jsonBody := map[string]interface{}{
+					"content":     nil,
+					"embeds":      embeds,
+					"attachments": nil,
+				}
+				body, err := json.Marshal(jsonBody)
+				if err != nil {
+					log.Printf("Error while marshalling webhook body!\n%v", err)
+				}
+				res, err := cD.Do(webhook.WebhookUrl, body)
+				if err != nil {
+					log.Printf("Error while sending webhook!\n%v", err)
+				}
+				if res.StatusCode == 404 {
+					log.Printf("Webhook %v is not found!", webhook.WebhookUrl)
+					DeleteWebhook(webhook)
+				}
+				if res.StatusCode == 429 {
+					log.Printf("Webhook %v is over rate limit!", webhook.WebhookUrl)
+				}
+				wg.Done()
+			}(webhook, webhook.PlayerIndex)
 		}
 	case "new":
 		break
@@ -595,7 +604,7 @@ func DeleteWebhook(webhook Webhook) {
 }
 
 func GetPersonalBests(user string, game string) PBs {
-	queryFrag := fmt.Sprintf("/users/%v/personal-bests?game=%v", user, game)
+	queryFrag := fmt.Sprintf("/users/%v/personal-bests?game=%v&vary=%v", user, game, time.Now().Nanosecond())
 	r, err := cS.Do(createReq(queryFrag))
 	if err != nil {
 		log.Printf("Error while getting leaderboard!\n%v", err)
